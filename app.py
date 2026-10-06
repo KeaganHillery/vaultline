@@ -21,11 +21,16 @@ def db():
 def init():
     c=db()
     c.executescript('''
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, category TEXT NOT NULL, description TEXT DEFAULT '', location TEXT DEFAULT '', owner TEXT DEFAULT '', expiry_date TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, filename TEXT NOT NULL, stored_name TEXT NOT NULL, uploaded_at TEXT NOT NULL, FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT NOT NULL, target TEXT, created_at TEXT NOT NULL);
-    '''); c.commit(); c.close()
+    ''');
+    try: c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+    except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError: pass
+    c.commit(); c.close()
 
 def audit(action,target=''):
     c=db(); c.execute('INSERT INTO audit(username,action,target,created_at) VALUES(?,?,?,?)',(session.get('user','system'),action,target,datetime.utcnow().isoformat(timespec='seconds'))); c.commit(); c.close()
@@ -39,19 +44,77 @@ def login_required(f):
 
 def allowed_file(fn): return '.' in fn and fn.rsplit('.',1)[1].lower() in ALLOWED
 
+def admin_required(f):
+    @wraps(f)
+    def w(*a,**kw):
+        if 'user' not in session: return redirect(url_for('login',next=request.path))
+        c=db(); row=c.execute('SELECT role,active FROM users WHERE username=?',(session['user'],)).fetchone(); c.close()
+        if not row or not row['active'] or row['role']!='admin': abort(403)
+        return f(*a,**kw)
+    return w
+
 @app.after_request
 def headers(r):
     r.headers['X-Content-Type-Options']='nosniff'; r.headers['X-Frame-Options']='DENY'; r.headers['Referrer-Policy']='no-referrer'; r.headers['Content-Security-Policy']="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:"
     return r
 
+@app.route('/setup',methods=['GET','POST'])
+def setup():
+    c=db(); count=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']; c.close()
+    if count: return redirect(url_for('login'))
+    if request.method=='POST':
+        u=request.form.get('username','').strip(); p=request.form.get('password',''); confirm=request.form.get('confirm_password','')
+        if not u or len(p)<8 or p!=confirm:
+            flash('Use a username and matching password of at least 8 characters.','error')
+            return render_template('setup.html')
+        c=db()
+        c.execute('INSERT INTO users(username,password,role,active,created_at) VALUES(?,?,?,?,?)',(u,generate_password_hash(p),'admin',1,datetime.utcnow().isoformat(timespec='seconds')))
+        c.commit(); c.close()
+        flash('Administrator account created.','ok')
+        return redirect(url_for('login'))
+    return render_template('setup.html')
+
 @app.route('/login',methods=['GET','POST'])
 def login():
+    c=db(); count=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']; c.close()
+    if count==0: return redirect(url_for('setup'))
     if request.method=='POST':
         u=request.form.get('username','').strip(); p=request.form.get('password','')
         c=db(); row=c.execute('SELECT * FROM users WHERE username=?',(u,)).fetchone(); c.close()
-        if row and check_password_hash(row['password'],p): session['user']=u; audit('login'); return redirect(request.args.get('next') or url_for('dashboard'))
+        if row and row['active'] and check_password_hash(row['password'],p): session['user']=u; audit('login'); return redirect(request.args.get('next') or url_for('dashboard'))
         flash('Invalid username or password.','error')
     return render_template('login.html')
+
+@app.route('/admin')
+@admin_required
+def admin():
+    c=db(); users=c.execute('SELECT id,username,role,active,created_at FROM users ORDER BY username COLLATE NOCASE').fetchall(); c.close()
+    return render_template('admin.html',users=users)
+
+@app.route('/admin/user/new',methods=['POST'])
+@admin_required
+def admin_new_user():
+    u=request.form.get('username','').strip(); p=request.form.get('password',''); role=request.form.get('role','user')
+    if not u or len(p)<8 or role not in ('user','admin'):
+        flash('Enter a username, password of at least 8 characters, and a valid role.','error')
+        return redirect(url_for('admin'))
+    try:
+        c=db()
+        c.execute('INSERT INTO users(username,password,role,active,created_at) VALUES(?,?,?,?,?)',(u,generate_password_hash(p),role,1,datetime.utcnow().isoformat(timespec='seconds')))
+        c.commit(); c.close()
+        flash('User created.','ok')
+    except sqlite3.IntegrityError:
+        flash('Username already exists.','error')
+    return redirect(url_for('admin'))
+
+@app.route('/admin/user/<int:id>/toggle',methods=['POST'])
+@admin_required
+def admin_toggle_user(id):
+    c=db(); row=c.execute('SELECT username,active FROM users WHERE id=?',(id,)).fetchone()
+    if row and row['username']!=session['user']:
+        c.execute('UPDATE users SET active=? WHERE id=?',(0 if row['active'] else 1,id)); c.commit()
+    c.close()
+    return redirect(url_for('admin'))
 
 @app.route('/logout')
 def logout(): session.clear(); return redirect(url_for('login'))
@@ -138,7 +201,7 @@ def export():
     c=db(); items=[dict(x) for x in c.execute('SELECT * FROM items').fetchall()]; docs=[dict(x) for x in c.execute('SELECT id,item_id,filename,uploaded_at FROM documents').fetchall()]; c.close(); audit('export'); return jsonify({'vaultline_export_version':1,'exported_at':datetime.utcnow().isoformat(timespec='seconds')+'Z','items':items,'documents':docs})
 
 @app.route('/health')
-def health(): return jsonify(status='ok',version='1.0.0')
+def health(): return jsonify(status='ok',version='1.1.0')
 
 init()
 
